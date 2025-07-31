@@ -29,7 +29,7 @@ import Network
 ///     }
 /// })
 /// ```
-
+let FTP_DEBUG = true        // ← 需要时设 true
 public class FTPClient {
     private let credentials: FTPCredentials
     private let remotePath: String
@@ -166,7 +166,9 @@ public class FTPClient {
         }
     }
     
+    // --- sendCommand: 每发一条命令就打印 ---
     private func sendCommand(_ command: String) async throws {
+        if FTP_DEBUG { print("→", command) }
         guard let connection = controlConnection else {
             throw FTPError.connectionFailed("No control connection available.")
         }
@@ -186,6 +188,7 @@ public class FTPClient {
         }
     }
     
+    // --- readResponse: 每收一条响应就打印 ---
     private func readResponse() async throws -> String {
         guard let connection = controlConnection else {
             throw FTPError.connectionFailed("No control connection available.")
@@ -207,11 +210,11 @@ public class FTPClient {
                 }
             }
             completeResponse += partialResponse
-            // Check if response is complete (ends with \r\n)
             if completeResponse.hasSuffix("\r\n") {
                 break
             }
         }
+        if FTP_DEBUG { print("←", completeResponse.trimmingCharacters(in: .whitespacesAndNewlines)) }
         return completeResponse
     }
     
@@ -249,7 +252,13 @@ public class FTPClient {
                 if let data = data, !data.isEmpty {
                     try await sendData(data: data, over: dataConnection)
                     progress.completedUnitCount += Int64(data.count)
+                    if FTP_DEBUG {
+    print("◆ 已发送 \(progress.completedUnitCount)/\(progress.totalUnitCount) bytes")
+}
                     progressHandler(progress)
+                    if FTP_DEBUG {
+    print("◆ 已发送 \(progress.completedUnitCount)/\(progress.totalUnitCount) bytes")
+}
                 } else {
                     break
                 }
@@ -299,45 +308,53 @@ public class FTPClient {
         }
     }
     
-    private func enterPassiveModeAndOpenDataConnection() async throws -> NWConnection {
-        try await sendCommand("PASV")
-        let pasvResponse = try await readResponse()
-        
-        // Parse PASV response
-        let pattern = "\\((.*?)\\)"
-        let regex = try NSRegularExpression(pattern: pattern)
-        guard let match = regex.firstMatch(in: pasvResponse, range: NSRange(pasvResponse.startIndex..., in: pasvResponse)) else {
-            throw FTPError.other("Failed to parse PASV response: \(pasvResponse)")
-        }
-        let range = Range(match.range(at: 1), in: pasvResponse)!
-        let numbersString = pasvResponse[range]
-        let numbers = numbersString.split(separator: ",").compactMap { UInt16($0.trimmingCharacters(in: .whitespaces)) }
-        guard numbers.count == 6 else {
-            throw FTPError.other("Invalid PASV response format: \(pasvResponse)")
-        }
-        let host = "\(numbers[0]).\(numbers[1]).\(numbers[2]).\(numbers[3])"
-        let port = (numbers[4] << 8) + numbers[5]
-        
-        let dataConnection = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
-        
-        try await withSafeStateHandler { completion in
-            dataConnection.stateUpdateHandler = { state in
-                switch state {
-                case .ready:
-                    completion(.success(()))
-                case .failed(let error):
-                    completion(.failure(FTPError.connectionFailed(error.localizedDescription)))
-                case .cancelled:
-                    completion(.failure(FTPError.cancelled))
-                default:
-                    break
-                }
-            }
-            dataConnection.start(queue: .global())
-        }
-        
-        return dataConnection
+private func enterPassiveModeAndOpenDataConnection() async throws -> NWConnection {
+    try await sendCommand("PASV")
+    let pasvResponse = try await readResponse()
+    
+    // Parse PASV response
+    let pattern = "\\((.*?)\\)"
+    let regex = try NSRegularExpression(pattern: pattern)
+    guard let match = regex.firstMatch(in: pasvResponse, range: NSRange(pasvResponse.startIndex..., in: pasvResponse)) else {
+        throw FTPError.other("Failed to parse PASV response: \(pasvResponse)")
     }
+    let range = Range(match.range(at: 1), in: pasvResponse)!
+    let numbersString = pasvResponse[range]
+    let numbers = numbersString.split(separator: ",").compactMap { UInt16($0.trimmingCharacters(in: .whitespaces)) }
+    guard numbers.count == 6 else {
+        throw FTPError.other("Invalid PASV response format: \(pasvResponse)")
+    }
+
+    // ⭐️ Patch: 如果是 172.20.72.231 则强制用公网 IP
+    let host: String
+    if numbers[0] == 172 && numbers[1] == 20 && numbers[2] == 72 && numbers[3] == 231 {
+        host = "47.111.157.125"
+    } else {
+        host = "\(numbers[0]).\(numbers[1]).\(numbers[2]).\(numbers[3])"
+    }
+    let port = (numbers[4] << 8) + numbers[5]
+    
+    let dataConnection = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
+    
+    try await withSafeStateHandler { completion in
+        dataConnection.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                if FTP_DEBUG { print("◆ Data-socket ready → \(host):\(port)") }
+                completion(.success(()))
+            case .failed(let error):
+                completion(.failure(FTPError.connectionFailed(error.localizedDescription)))
+            case .cancelled:
+                completion(.failure(FTPError.cancelled))
+            default:
+                break
+            }
+        }
+        dataConnection.start(queue: .global())
+    }
+    
+    return dataConnection
+}
     
     private func sendData(data: Data, over connection: NWConnection) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
